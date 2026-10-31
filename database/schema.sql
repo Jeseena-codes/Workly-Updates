@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS employees (
   designation TEXT,
   status employee_status NOT NULL DEFAULT 'active',
   joined_on DATE,
+  phone TEXT,
+  address TEXT,
+  emergency_contact JSONB,
+  date_of_birth DATE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -179,6 +183,8 @@ ALTER TABLE employees ADD COLUMN IF NOT EXISTS account_status TEXT NOT NULL DEFA
 ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS uploaded_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
 ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS replaced_by UUID REFERENCES employee_documents(id) ON DELETE SET NULL;
 ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS access_level TEXT NOT NULL DEFAULT 'admin';
+ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS file_size BIGINT;
+ALTER TABLE employee_documents ADD COLUMN IF NOT EXISTS mime_type TEXT;
 
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS team_lead_id UUID REFERENCES employees(id) ON DELETE SET NULL;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
@@ -232,6 +238,9 @@ ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS decided_by UUID REFERENCES a
 ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
 ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS decision_reason TEXT;
 ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS policy_exception BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS flag_reason TEXT;
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS allocated_days NUMERIC(6,2) NOT NULL DEFAULT 0;
+ALTER TABLE leave_balances ADD COLUMN IF NOT EXISTS used_days NUMERIC(6,2) NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS leave_decisions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   leave_request_id UUID NOT NULL REFERENCES leave_requests(id) ON DELETE RESTRICT,
@@ -282,6 +291,8 @@ ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS shift_name TEXT;
 ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS break_minutes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS overtime_minutes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS total_work_minutes INTEGER;
+ALTER TABLE attendance_records DROP CONSTRAINT IF EXISTS attendance_records_check_times;
+ALTER TABLE attendance_records ADD CONSTRAINT attendance_records_check_times CHECK (check_out IS NULL OR check_in IS NULL OR check_out > check_in);
 
 CREATE INDEX IF NOT EXISTS employee_documents_expiry_idx ON employee_documents(expiry_date);
 CREATE INDEX IF NOT EXISTS task_reassignments_task_idx ON task_reassignments(task_id);
@@ -295,7 +306,8 @@ CREATE OR REPLACE FUNCTION public.decide_leave_request(
   p_decision leave_status,
   p_chargeable_days NUMERIC,
   p_reason TEXT,
-  p_actor_id UUID
+  p_actor_id UUID,
+  p_policy_exception BOOLEAN DEFAULT FALSE
 ) RETURNS leave_requests
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
 AS $$
@@ -306,14 +318,17 @@ BEGIN
   IF NOT FOUND THEN RAISE EXCEPTION 'Leave request not found'; END IF;
   IF request_row.status <> 'pending' THEN RAISE EXCEPTION 'Only pending leave requests can be decided'; END IF;
   IF p_chargeable_days IS NULL OR p_chargeable_days < 0 THEN RAISE EXCEPTION 'Chargeable leave days must be zero or more'; END IF;
-  IF p_decision = 'approved' THEN
-    INSERT INTO leave_balances (employee_id, leave_type, balance_days)
-    VALUES (request_row.employee_id, request_row.leave_type, -p_chargeable_days)
+  IF p_decision = 'approved' AND request_row.leave_type <> 'unpaid' THEN
+    INSERT INTO leave_balances (employee_id, leave_type, allocated_days, used_days, balance_days)
+    VALUES (request_row.employee_id, request_row.leave_type, 0, p_chargeable_days, -p_chargeable_days)
     ON CONFLICT (employee_id, leave_type)
-    DO UPDATE SET balance_days = leave_balances.balance_days - p_chargeable_days;
+    DO UPDATE SET
+      used_days = COALESCE(leave_balances.used_days, 0) + p_chargeable_days,
+      balance_days = leave_balances.balance_days - p_chargeable_days;
   END IF;
   UPDATE leave_requests SET status = p_decision, chargeable_days = p_chargeable_days,
-    decision_reason = p_reason, decided_by = p_actor_id, decided_at = NOW()
+    decision_reason = p_reason, decided_by = p_actor_id, decided_at = NOW(),
+    policy_exception = COALESCE(p_policy_exception, FALSE)
   WHERE id = p_request_id RETURNING * INTO request_row;
   INSERT INTO leave_decisions (leave_request_id, decision, chargeable_days, reason, decided_by)
   VALUES (p_request_id, p_decision, p_chargeable_days, p_reason, p_actor_id);
@@ -394,3 +409,38 @@ CREATE POLICY "admins manage leave decisions" ON leave_decisions FOR ALL TO auth
 CREATE POLICY "admins manage attendance corrections" ON attendance_corrections FOR ALL TO authenticated USING (public.is_workly_admin()) WITH CHECK (public.is_workly_admin());
 CREATE POLICY "admins manage notification preferences" ON notification_preferences FOR ALL TO authenticated USING (public.is_workly_admin()) WITH CHECK (public.is_workly_admin());
 CREATE POLICY "admins manage employee invitations" ON employee_invitations FOR ALL TO authenticated USING (public.is_workly_admin()) WITH CHECK (public.is_workly_admin());
+
+-- Storage setup for Employee Documents (Private Bucket)
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+  'employee-documents',
+  'employee-documents',
+  false,
+  20971520,
+  ARRAY['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'image/jpeg', 'image/png', 'image/webp', 'text/plain']
+)
+ON CONFLICT (id) DO UPDATE SET
+  public = false,
+  file_size_limit = 20971520;
+
+DROP POLICY IF EXISTS "Admin upload employee documents" ON storage.objects;
+DROP POLICY IF EXISTS "Admin read employee documents" ON storage.objects;
+DROP POLICY IF EXISTS "Admin delete employee documents" ON storage.objects;
+DROP POLICY IF EXISTS "Admin update employee documents" ON storage.objects;
+
+CREATE POLICY "Admin upload employee documents" ON storage.objects
+  FOR INSERT TO authenticated
+  WITH CHECK (bucket_id = 'employee-documents' AND public.is_workly_admin());
+
+CREATE POLICY "Admin read employee documents" ON storage.objects
+  FOR SELECT TO authenticated
+  USING (bucket_id = 'employee-documents' AND public.is_workly_admin());
+
+CREATE POLICY "Admin delete employee documents" ON storage.objects
+  FOR DELETE TO authenticated
+  USING (bucket_id = 'employee-documents' AND public.is_workly_admin());
+
+CREATE POLICY "Admin update employee documents" ON storage.objects
+  FOR UPDATE TO authenticated
+  USING (bucket_id = 'employee-documents' AND public.is_workly_admin())
+  WITH CHECK (bucket_id = 'employee-documents' AND public.is_workly_admin());
